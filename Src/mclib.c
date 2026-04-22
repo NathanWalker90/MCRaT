@@ -4,38 +4,96 @@
 const double A_RAD=7.56e-15, C_LIGHT=2.99792458e10, PL_CONST=6.6260755e-27, FINE_STRUCT=7.29735308e-3, CHARGE_EL= 4.8032068e-10;
 const double K_B=1.380658e-16, M_P=1.6726231e-24, THOM_X_SECT=6.65246e-25, M_EL=9.1093879e-28 , R_EL=2.817941499892705e-13;
 
+/* Global thread-local RNG pool (declare in header or at file scope) */
+static gsl_rng **global_thread_rng = NULL;
+static int global_num_threads = 0;
+
+void initGlobalThreadRNG(gsl_rng *master_rng, int num_threads)
+{
+    if (global_thread_rng)
+    {
+        /* Already initialized, free old ones */
+        for (int i = 1; i < global_num_threads; i++)
+        {
+            gsl_rng_free(global_thread_rng[i]);
+        }
+        free(global_thread_rng);
+    }
+    
+    global_num_threads = num_threads;
+    global_thread_rng = malloc(num_threads * sizeof(gsl_rng *));
+    global_thread_rng[0] = master_rng;
+    
+    const gsl_rng_type *rng_t = gsl_rng_ranlxs0;
+    for (int i = 1; i < num_threads; i++)
+    {
+        global_thread_rng[i] = gsl_rng_alloc(rng_t);
+        gsl_rng_set(global_thread_rng[i], gsl_rng_get(master_rng));
+    }
+}
+
+void freeGlobalThreadRNG(void)
+{
+    if (global_thread_rng)
+    {
+        for (int i = 1; i < global_num_threads; i++)
+        {
+            gsl_rng_free(global_thread_rng[i]);
+        }
+        free(global_thread_rng);
+        global_thread_rng = NULL;
+        global_num_threads = 0;
+    }
+}
+
+
 
 
 void photonInjection(struct photonList *photon_list, double r_inj, double ph_weight, int min_photons, int max_photons, char spect, double theta_min, double theta_max, struct hydro_dataframe *hydro_data, gsl_rng * rand, FILE *fPtr)
-{
+{	
+	//fprintf(fPtr,"NATHAN: inside the injection function\n");
+	//fflush(fPtr);
     int i=0, block_cnt=0, *ph_dens=NULL, ph_tot=0, j=0,k=0;
-    double ph_dens_calc=0.0, fr_dum=0.0, y_dum=0.0, yfr_dum=0.0, fr_max=0, bb_norm=0, position_phi, ph_weight_adjusted, rmin, rmax;
+    double ph_dens_calc=0.0, fr_dum=1.0, y_dum=0.0, yfr_dum=0.0, fr_max=0, bb_norm=0, position_phi, ph_weight_adjusted, rmin, rmax;
     double com_v_phi, com_v_theta, *p_comv=NULL, *boost=NULL; //comoving phi, theta, comoving 4 momentum for a photon, and boost for photon(to go to lab frame)
     double *l_boost=NULL; //pointer to hold array of lorentz boost, to lab frame, values
     float num_dens_coeff;
     double r_grid_innercorner=0, r_grid_outercorner=0, theta_grid_innercorner=0, theta_grid_outercorner=0;
     double position_rand=0, position2_rand=0, position3_rand=0, cartesian_position_rand_array[3];
-    struct photon *ph=NULL;
-    
+    struct photon *ph=NULL, initialized_photon;
+    //fprintf(fPtr,"NATHAN: initiated variables\n"); 
+    //fflush(fPtr);
+    //define the number density coeficient, integrate the number density spectrum from 0 to infinity to get this value
+    //used to calculate the number density of photons as num_dens_coeff*T_comv^3
+    // how should this be defined for the custom spectrum case? -> made it be an input that the user sets
     if (spect=='w') //from MCRAT paper, w for wien spectrum 
     {
         num_dens_coeff=8.44;
         //printf("in wien spectrum\n");
     }
-    else
+    else if (spect=='b')
     {
         num_dens_coeff=20.29; //this is for black body spectrum
         //printf("in BB spectrum");
     }
+    else
+    {
+        num_dens_coeff=PHOTON_DENSITY_COEFF;
+    }
     
+    //fprintf(fPtr,"NATHAN: Read in spectrum\n"); 
+    //fflush(fPtr);
     //find how many blocks are near the injection radius within the angles defined in mc.par, get temperatures and calculate number of photons to allocate memory for 
     //and then rcord which blocks have to have "x" amount of photons injected there
-    
+    //fprintf(fPtr,"NATHAN: fps = %lf\n", hydro_data->fps); 
     rmin=r_inj - 0.5*C_LIGHT/hydro_data->fps;
     rmax=r_inj + 0.5*C_LIGHT/hydro_data->fps;
-    
+    fprintf(fPtr,"NATHAN: Starting injection loop\n"); 
+	fflush(fPtr);
     for(i=0; i<hydro_data->num_elements; i++)
     {
+		//fprintf(fPtr, "NATHAN: injection loop i = %d\n", i);
+		fflush(fPtr);
         #if DIMENSIONS == THREE
             //want inner corner to be close to origin, therfore ned to have abs for 3D cartesian with negative coordinates, shouldnt affect the other geometry systems since theyre all defined from r=0, theta=0, phi=0
         
@@ -49,7 +107,8 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
             hydroCoordinateToSpherical(&r_grid_innercorner, &theta_grid_innercorner, (hydro_data->r0)[i]-0.5*(hydro_data->r0_size)[i], (hydro_data->r1)[i]-0.5*(hydro_data->r1_size)[i], 0);
             hydroCoordinateToSpherical(&r_grid_outercorner, &theta_grid_outercorner, (hydro_data->r0)[i]+0.5*(hydro_data->r0_size)[i], (hydro_data->r1)[i]+0.5*(hydro_data->r1_size)[i], 0);
         #endif
-        
+        //fprintf(fPtr, "NATHAN: injection coordinate transformation performed\n");
+		fflush(fPtr); 
         //look at all boxes in width delta r=c/fps and within angles we are interested in 
         //if ((rmin <= r_grid_outercorner) && (r_grid_innercorner  <= rmax ) && (theta_grid_outercorner >= theta_min) && (theta_grid_innercorner <= theta_max) && ((hydro_data->r0_size)[i]<1e11) && ((hydro_data->r1_size)[i]<0.09))
         if ((rmin <= r_grid_outercorner) && (r_grid_innercorner  <= rmax ) && (theta_grid_outercorner >= theta_min) && (theta_grid_innercorner <= theta_max))
@@ -59,6 +118,8 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
             // also try inj at frame 1 with scale 1e11 -> didnt fixed normalization issue not N_scatt issue
             // also try inj at frame 0 (orig) to see what gets printed for diagnosing CHOMBO refinement levels being an issue
             // try inj at frame 0 with modified if statement and L scale 1e11
+			fprintf(fPtr,"NATHAN: block count = %d\n", block_cnt);
+			fflush(fPtr);
             block_cnt++;
             //#if DIMENSIONS == THREE
             //fprintf(fPtr,"rmin %e rmax %e thetamin %e thetamax %e hydro: r0 %e r1 %e r2 %e r0_size %e r1_size %e r2_size %e r_inner %e theta_inner %e r_outer %e theta_outer %e\n", rmin, rmax, theta_min, theta_max, (hydro_data->r0)[i], (hydro_data->r1)[i], (hydro_data->r2)[i], (hydro_data->r0_size)[i], (hydro_data->r1_size)[i], (hydro_data->r2_size)[i], r_grid_innercorner, theta_grid_innercorner, r_grid_outercorner, theta_grid_outercorner);
@@ -68,7 +129,8 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
             //fflush(fPtr);
         }
     }
-    //printf("Blocks: %d\n", block_cnt);
+    //fprintf("Blocks: %d\n", block_cnt);
+	//fflush(fPtr);
     
     //allocate memory to record density of photons for each block
     ph_dens=malloc(block_cnt * sizeof(int));
@@ -77,7 +139,8 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
     j=0;
     ph_tot=0;
     ph_weight_adjusted=ph_weight;
-    //printf("%d %d\n", max_photons, min_photons);
+    //printf(fPtr,"%d %d\n", max_photons, min_photons);
+	//fflush(fPtr);
     while ((ph_tot>max_photons) || (ph_tot<min_photons) )
     {
         j=0;
@@ -105,7 +168,7 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
             //if ((rmin <= r_grid_outercorner) && (r_grid_innercorner  <= rmax ) && (theta_grid_outercorner >= theta_min) && (theta_grid_innercorner <= theta_max) && ((hydro_data->r0_size)[i]<1e11) && ((hydro_data->r1_size)[i]<0.09))
             if ((rmin <= r_grid_outercorner) && (r_grid_innercorner  <= rmax ) && (theta_grid_outercorner >= theta_min) && (theta_grid_innercorner <= theta_max))
             {
-                ph_dens_calc=(4.0/3.0)*hydroElementVolume(hydro_data, i) *(((hydro_data->gamma)[i]*num_dens_coeff*(hydro_data->temp)[i]*(hydro_data->temp)[i]*(hydro_data->temp)[i])/ph_weight_adjusted); //4 comes from L \propto 4p in the limit radiation pressure is greater than the matter energy density and 3 comes from p=u/3, where u is the energy density
+                ph_dens_calc=(4.0/3.0)*hydroElementVolume(hydro_data, i) *(((hydro_data->gamma)[i]*num_dens_coeff*(hydro_data->temp)[i]*(hydro_data->temp)[i]*(hydro_data->temp)[i])/ph_weight_adjusted/hydro_data->fps); //4 comes from L \propto 4p in the limit radiation pressure is greater than the matter energy density and 3 comes from p=u/3, where u is the energy density
                 
                 (*(ph_dens+j))=gsl_ran_poisson(rand,ph_dens_calc) ; //choose from poission distribution with mean of ph_dens_calc
                  
@@ -176,6 +239,7 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
                 //have to get random frequency for the photon comoving frequency
                 if (spect=='w')
                 {
+                    /* old way which also seemed to  be wrong in many ways
                     y_dum=1; //initalize loop
                     yfr_dum=0;
                     while (y_dum>yfr_dum)
@@ -187,33 +251,37 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
                     
                         yfr_dum=(1.0/(1.29e31))*pow((fr_dum/((hydro_data->temp)[i])),3.0)/(exp((PL_CONST*fr_dum)/(K_B*((hydro_data->temp)[i]) ))-1); //curve is normalized to maximum
                     }
+                     */
+                    //now sample from a gamma distribution with a=2 and b=1 (x^2*e^-x) and then convert x=h \nu / k_B*T to frequency \nu
+                    //this is due to the fact that we are sampling from the wien photon density spectrum which is the wien spectrum divided by h \nu.
+                    //verified with simulations in python to verify this sampled function and transform does actually return a wien function for sufficiently large sample size (of 100000)
+                    fr_dum = gsl_ran_gamma(rand, 3.0, 1.0);
+                    fr_dum*=K_B*((hydro_data->temp)[i])/PL_CONST;
+                    
+                }
+                else if (spect=='b')
+                {
+                    fr_max=(3.31e10)*((hydro_data->temp)[i]);//max frequency of bb photon density spectrum
+                    bb_norm=( pow((fr_max),2.0))/gsl_expm1(PL_CONST*fr_max/(K_B*((hydro_data->temp)[i]))); //(exp(PL_CONST*fr_max/(K_B*bb_temp))-1); //find value of bb at fr_max
+                    y_dum=1; //initalize loop
+                    yfr_dum=0;
+                    while (y_dum>yfr_dum)
+                    {
+                        fr_dum=gsl_rng_uniform_pos(rand)*6.3e11*((hydro_data->temp)[i]); //in Hz
+                        //printf("%lf, %lf ",gsl_rng_uniform_pos(rand), (*(temps+i)));
+                        y_dum=gsl_rng_uniform_pos(rand);
+                        
+                        yfr_dum=((1.0/bb_norm)* pow((fr_dum),2.0))/gsl_expm1(PL_CONST*fr_dum/(K_B*((hydro_data->temp)[i]))); //(exp(PL_CONST*fr_dum/(K_B*bb_temp))-1); //curve is normalized to vaue of bb @ max frequency
+                    }
+
                 }
                 else
                 {
-                        /* old way
-                        fr_max=(5.88e10)*((hydro_data->temp)[i]);//(C_LIGHT*(*(temps+i)))/(0.29); //max frequency of bb
-                        bb_norm=(PL_CONST*fr_max * pow((fr_max/C_LIGHT),2.0))/(exp(PL_CONST*fr_max/(K_B*((hydro_data->temp)[i])))-1); //find value of bb at fr_max
-                        yfr_dum=((1.0/bb_norm)*PL_CONST*fr_dum * pow((fr_dum/C_LIGHT),2.0))/(exp(PL_CONST*fr_dum/(K_B*((hydro_data->temp)[i])))-1); //curve is normalized to vaue of bb @ max frequency
-                        */
-                        
-                        test=0;
-                        test_rand1=gsl_rng_uniform_pos(rand);
-                        test_rand2=gsl_rng_uniform_pos(rand);
-                        test_rand3=gsl_rng_uniform_pos(rand);
-                        test_rand4=gsl_rng_uniform_pos(rand);
-                        test_rand5=gsl_rng_uniform_pos(rand);
-                        test_cnt=0;
-                        while (test<M_PI*M_PI*M_PI*M_PI*test_rand1/90.0)
-                        {
-                            test_cnt+=1;
-                            test+=1/(test_cnt*test_cnt*test_cnt*test_cnt);
-                        }
-                        fr_dum=-log(test_rand2*test_rand3*test_rand4*test_rand5)/test_cnt;
-                        fr_dum*=K_B*((hydro_data->temp)[i])/PL_CONST;
-                        y_dum=0; yfr_dum=1;
-                        
+                    //this is for custom spectrum sampling
+                    initialized_photon = custom_photon_sampler(hydro_data, i, rand, fPtr);
+                    
                 }
-                    //printf("%lf, %lf,%lf,%e \n",(*(temps+i)),fr_dum, y_dum, yfr_dum);
+                //printf("%lf, %lf,%lf,%e \n",(hydro_data->temp)[i],fr_dum, y_dum, yfr_dum);
                     
                 
                 //printf("i: %d freq:%lf\n ",ph_tot, fr_dum);
@@ -222,8 +290,30 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
                 #else
                     position_phi=0;//dont need this in 3D
                 #endif
-               com_v_phi=gsl_rng_uniform(rand)*2*M_PI;
-               com_v_theta=acos((gsl_rng_uniform(rand)*2)-1);
+                com_v_phi=samplePhotonPhi(rand, fPtr); //gsl_rng_uniform(rand)*2*M_PI;
+               //this seemed to produce lab frame spectra with significantly differnet temperatures/shapes than what was expected for wien/blackbody spectra. this is only valid when beta=0, which is limiting case of our anisotropic sampling below
+               //com_v_theta=acos((gsl_rng_uniform(rand)*2)-1);
+                
+                //TODO:what is boost at the start of this loop? it seems undefined
+               //trying to overwrite com_v_theta based on sampling of lab anisotropic angle distribution of photons
+               //see eg Section 3.2.1 @ doi.org/10.1088/0004-637X/807/1/31 & Section 3.5 @ doi.org/10.3847/1538-4357/ac75cb
+               // and section 6.2 here: Nordin Nobuoka, J. 2025, SPIRO: a code that couples Monte Carlo photons to relativistic hydrodynamics - Applications to hot astrophysical plasmas, https://urn.kb.se/resolve?urn=urn:nbn:se:kth:diva-368279
+               gsl_vector_view b=gsl_vector_view_array(boost, 3);
+               double beta=gsl_blas_dnrm2(&b.vector);
+               y_dum=1; //initalize loop
+               yfr_dum=0;
+               while (y_dum>yfr_dum)
+               {
+                   com_v_theta=2*gsl_rng_uniform_pos(rand)-1; //cos(angle) is from -1 to 1
+                   //printf("%lf, %lf ",gsl_rng_uniform_pos(rand), (*(temps+i)));
+                   y_dum=gsl_rng_uniform_pos(rand);
+                    
+                   yfr_dum=0.5*(1+beta*com_v_theta); //propability density of angle of photon with respect to fluid motion (doppler boosting factor)
+               }
+                com_v_theta=samplePhotonTheta(boost, rand, fPtr); //acos(com_v_theta);
+               //trying to overwrite com_v_theta based on sampling of lab anisotropic angle distribution of photons
+
+                
                //printf("%lf, %lf, %lf\n", position_phi, com_v_phi, com_v_theta);
                
                //populate 4 momentum comoving array
@@ -286,6 +376,12 @@ void photonInjection(struct photonList *photon_list, double r_inj, double ph_wei
                 ph[ph_tot].type=INJECTED_PHOTON; //i for injected
                 ph[ph_tot].recalc_properties=1; //set to 1 so we are sure that we calculate tau values later on
                 //printf("%d\n",ph_tot);
+                
+                if ((spect!='w') && (spect!='b'))
+                {
+                    saveUserDefinePhoton((ph+ph_tot), &initialized_photon, hydro_data, i, rand, fPtr);
+                }
+
                 ph_tot++;
             }
             k++;
@@ -442,13 +538,13 @@ int findContainingHydroCell( struct photonList *photon_list, struct hydro_datafr
     struct photon *ph=NULL;
 
     #if defined(_OPENMP)
-    num_thread=omp_get_num_threads(); //default is one above if theres no openmp usage
+        num_thread = omp_get_max_threads();
     #endif
-
+    
     //initialize gsl random number generator fo each thread
+    /*
     const gsl_rng_type *rng_t;
     gsl_rng **rng;
-    gsl_rng_env_setup();
     rng_t = gsl_rng_ranlxs0;
 
     rng = (gsl_rng **) malloc((num_thread ) * sizeof(gsl_rng *));
@@ -460,12 +556,13 @@ int findContainingHydroCell( struct photonList *photon_list, struct hydro_datafr
         rng[i] = gsl_rng_alloc (rng_t);
         gsl_rng_set(rng[i],gsl_rng_get(rand));
     }
+     */
 
     //go through each photon and find the blocks around it and then get the distances to all of those blocks and choose the one thats the shortest distance away
     //can optimize here, exchange the for loops and change condition to compare to each of the photons is the radius of the block is .95 (or 1.05) times the min (max) photon radius
     //or just parallelize this part here
     
-    #pragma omp parallel for num_threads(num_thread) firstprivate( is_in_block, ph_block_index,  ph_phi, min_index, ph_p_comv, ph_p, fluid_beta, ph) private(i) reduction(+:num_photons_find_new_element)
+    #pragma omp parallel for num_threads(num_thread) firstprivate( is_in_block, ph_block_index,  ph_phi, min_index, ph_p_comv, ph_p, fluid_beta, photon_hydro_coord, ph) private(i, thread_id) reduction(+:num_photons_find_new_element)
     for (i=0;i<photon_list->list_capacity; i++)
     {
         ph=getPhoton(photon_list, i);
@@ -567,7 +664,7 @@ int findContainingHydroCell( struct photonList *photon_list, struct hydro_datafr
                     #endif
 
                     //need to also recalculate the optical depth
-                    calculateOpticalDepth(ph, hydro_data, rng[thread_id], fPtr);
+                    calculateOpticalDepth(ph, hydro_data, global_thread_rng[thread_id], fPtr);
                     if ((ph->recalc_properties)==1)
                     {
                         //if we already needed to recalc the optical depth (due to a scattering or something) else
@@ -597,12 +694,13 @@ int findContainingHydroCell( struct photonList *photon_list, struct hydro_datafr
     }
     
     //free rand number generator
+    /*
     for (i=1;i<num_thread;i++)
     {
         gsl_rng_free(rng[i]);
     }
     free(rng);
-
+     */
 
     //print number of times we had to refind the index of the elemtn photons were located in
     if (find_nearest_block_switch!=0)
@@ -623,13 +721,13 @@ void calcMeanFreePath(struct photonList *photon_list, struct hydro_dataframe *hy
     struct photon *ph=NULL;
 
     #if defined(_OPENMP)
-        num_thread=omp_get_num_threads(); //default is one above if theres no openmp usage
+        num_thread = omp_get_max_threads();
     #endif
 
     //initialize gsl random number generator fo each thread
+    /*
     const gsl_rng_type *rng_t;
     gsl_rng **rng;
-    gsl_rng_env_setup();
     rng_t = gsl_rng_ranlxs0;
 
     rng = (gsl_rng **) malloc((num_thread ) * sizeof(gsl_rng *));
@@ -641,10 +739,13 @@ void calcMeanFreePath(struct photonList *photon_list, struct hydro_dataframe *hy
         rng[i] = gsl_rng_alloc (rng_t);
         gsl_rng_set(rng[i],gsl_rng_get(rand));
     }
+     */
 
-    #pragma omp parallel for num_threads(num_thread) firstprivate(ph_block_index, mfp, rnd_tracker, ph) private(i) shared(default_mfp)
+    #pragma omp parallel for num_threads(num_thread) firstprivate(ph_block_index, mfp, rnd_tracker, ph) private(i, thread_id) shared(default_mfp)
     for (i=0;i<photon_list->list_capacity; i++)
     {
+        photon_list->sorted_indexes[i]=i; //save  indexes to array to use in qsort
+
         ph=getPhoton(photon_list, i);
         
         ph_block_index=ph->nearest_block_index;
@@ -668,11 +769,11 @@ void calcMeanFreePath(struct photonList *photon_list, struct hydro_dataframe *hy
             if ((ph->recalc_properties)==1)
             {
                 //if we need to recalc the optical depth (due to a scattering or something) else then do so
-                calculateOpticalDepth(ph, hydro_data, rng[thread_id], fPtr);
+                calculateOpticalDepth(ph, hydro_data, global_thread_rng[thread_id], fPtr);
                 (ph->recalc_properties)=0;
             }
 
-            rnd_tracker=gsl_rng_uniform_pos(rng[thread_id]);
+            rnd_tracker=gsl_rng_uniform_pos(global_thread_rng[thread_id]);
             //printf("Rnd_tracker: %e Thread number %d \n",rnd_tracker, omp_get_thread_num() );
 
             //mfp=(-1)*log(rnd_tracker)*(M_P/((n_dens_tmp))/(THOM_X_SECT)); ///(1.0-beta*((n_cosangle)))) ; // the mfp and then multiply it by the ln of a random number to simulate distribution of mean free paths IN COMOV FRAME for reference
@@ -683,8 +784,10 @@ void calcMeanFreePath(struct photonList *photon_list, struct hydro_dataframe *hy
         {
             mfp=default_mfp;
         }
-
+        
+        //save values to use in qsort and to the photon struct itself
         (ph->time_to_scatter)=mfp/C_LIGHT;
+        *(all_time_steps+i)=(ph->time_to_scatter);
 
         //fprintf(fPtr,"Photon %d has time %e\n", i, *(all_time_steps+i));
         //fflush(fPtr);
@@ -692,20 +795,13 @@ void calcMeanFreePath(struct photonList *photon_list, struct hydro_dataframe *hy
     }
     //exit(0);
     //free rand number generator
+    /*
     for (i=1;i<num_thread;i++)
     {
         gsl_rng_free(rng[i]);
     }
     free(rng);
-
-    //printf("HERE\n");
-    for (i=0;i<photon_list->list_capacity;i++)
-    {
-        //ph=getPhoton(photon_list, i);
-        //*(sorted_indexes+i)= i; //save  indexes to array to use in qsort, not needed since we created the photonList struct
-        photon_list->sorted_indexes[i]=i; //save  indexes to array to use in qsort
-        *(all_time_steps+i)=getPhoton(photon_list, i)->time_to_scatter; //save values to use in qsort
-    }
+     */
 
     reverseSortIndexes(photon_list->sorted_indexes, photon_list->list_capacity, sizeof (int),  all_time_steps);
 
@@ -1056,12 +1152,13 @@ void updatePhotonPosition(struct photonList *photon_list, double t, FILE *fPtr)
     //move photons by speed of light
  
     int i=0;
-    #if defined(_OPENMP)
-    int num_thread=omp_get_num_threads();
-    #endif
     double old_position=0, new_position=0, divide_p0=0;
     struct photon *ph=NULL; //pointer to a photon struct
-    
+    #if defined(_OPENMP)
+        int num_thread=1;
+        num_thread = omp_get_max_threads();
+    #endif
+
     
     #pragma omp parallel for num_threads(num_thread) firstprivate(old_position, new_position, divide_p0, ph)
     for (i=0;i<photon_list->list_capacity;i++)
@@ -1118,6 +1215,7 @@ double photonEvent(struct photonList *photon_list, double dt_max, struct hydro_d
     double *negative_fluid_beta=malloc(3*sizeof(double));//pointer to hold negative fluid velocity vector
     double *s=malloc(4*sizeof(double)); //vector to hold the stokes parameters for a given photon
     struct photon *ph=NULL; //pointer to a photon struct
+    bool do_rotation=false; //boolean to help us determine if the stokes parameter needs to be rotated going from lab to fluid frame. We dont need to do this if the fluid is stationary, and if we do then we get a bunch of nans so avoid by setting to false
     
     i=0;
     old_scatt_time=0;
@@ -1143,6 +1241,7 @@ double photonEvent(struct photonList *photon_list, double dt_max, struct hydro_d
             
             //WHAT IF THE PHOTON MOVES TO A NEW BLOCK BETWEEN WHEN WE CALC MFP AND MOVE IT TO DO THE SCATTERING????
             //it mostly happens at low optical depth, near the photosphere so we would have a large mfp anyways so we probably wouldn't be in this function in that case
+            //TODO: if we have biasing then we can force scattering in low optical depth regions, so need to make sure we properly capture the properties where the scattering occurs
             index=ph->nearest_block_index; //the sorted_indexes gives index of photon with smallest time to potentially scatter then extract the index of the block closest to that photon
     
             fluid_temp=(hydro_data->temp)[index];
@@ -1222,11 +1321,13 @@ double photonEvent(struct photonList *photon_list, double dt_max, struct hydro_d
         
             //then rotate the stokes plane by some angle such that we are in the stokes coordinat eystsem after the lorentz boost
             #if STOKES_SWITCH == ON
-            {
-
-                stokesRotation(fluid_beta, (ph_p+1), (ph_p_comov+1), s, fPtr);
-                
-            }
+                //check to see if the fluid is not stationary and we need to do this frame rotation at all, otherwise we get nans
+                do_rotation=(!((*(fluid_beta+0) == 0) && (*(fluid_beta+1) == 0) && (*(fluid_beta+2) == 0)));
+            
+                if (do_rotation)
+                {
+                    stokesRotation(fluid_beta, (ph_p+1), (ph_p_comov+1), s, fPtr);
+                }
             #endif
             
             //exit(0);
@@ -1256,6 +1357,32 @@ double photonEvent(struct photonList *photon_list, double dt_max, struct hydro_d
             {
                 //fprintf(fPtr,"Within the if!\n");
                 //fflush(fPtr);
+                #if SCATTERING_BIAS_SWITCH == ON
+                    // if the scattering bias is 1, we already know that the weight of the nonscattered photon is 0 so can
+                    // ignore all of these steps
+                    if (ph->scattering_bias[scattering_subgroup] != 1)
+                    {
+                        double scattered_photon_weight = scatteredPhotonWeight(ph->weight, ph->scattering_bias[scattering_subgroup], ph-> optical_depths[scattering_subgroup]);
+                        double unscattered_photon_weight = ph->weight - scattered_photon_weight;
+                        
+                        //first we set the weight of the scattered photon to be the unscattered weight and then copy it into a new element of the photon_list. This works since none of the fields of the photon struct have been updated based on teh actual scattering yet. That occurs below.
+                        ph->weight = unscattered_photon_weight;
+                        
+                        //add the original to our photon list struct, which does a memcpy into a NULL photon's index
+                        //if the photon list has to be expanded, the ph pointer may no longer be valid.
+                        //try to get aroudn this by copying the contents of ph pointer to a new photon struct and then pass that in
+                        struct photon temp_ph;
+                        memcpy(&temp_ph, ph, sizeof(struct photon));
+                        addToPhotonList(photon_list, &temp_ph, 1);
+                        
+                        //now get the address of the scattered photon again incase the photon list was expanded and the original address is no longer valid
+                        ph=getPhoton(photon_list, ph_index);
+                        
+                        //now set the scattered photon weight field  to the correct value
+                        ph->weight = scattered_photon_weight;
+                    }
+                
+                #endif
             
                 //if the scattering occured have to uodate the phtoon 4 momentum. if photon didnt scatter nothing changes
                 //fourth we bring the photon back to the lab frame
@@ -1276,19 +1403,22 @@ double photonEvent(struct photonList *photon_list, double dt_max, struct hydro_d
 
                 
                 #if STOKES_SWITCH == ON
-                {
-                    stokesRotation(negative_fluid_beta, (ph_p_comov+1), (ph_p+1), s, fPtr); //rotate to boost back to lab frame
+                
+                    if (do_rotation)
+                    {
+                        stokesRotation(negative_fluid_beta, (ph_p_comov+1), (ph_p+1), s, fPtr); //rotate to boost back to lab frame
+                    }
                     
                     //save stokes parameters
                     (ph->s0)= *(s+0); //I ==1
                     (ph->s1)= *(s+1);
                     (ph->s2)= *(s+2);
                     (ph->s3)= *(s+3);
-                }
+                
                 #endif
             
 
-                if (((*(ph_p+0))*C_LIGHT/1.6e-9) > 1e4)
+                if (((*(ph_p+0))*ENERGY_TO_KEV) > 1e4)
                 {
                     //energy greater than 1e4 keV
                     fprintf(fPtr,"Extremely High Photon Energy!!!!!!!!\n");
@@ -1318,7 +1448,8 @@ double photonEvent(struct photonList *photon_list, double dt_max, struct hydro_d
                 *frame_scatt_cnt+=1; //incrememnt total number of scatterings
 
                 //we need to make sure that the tau for this photon gets recalculated since we have a new comoving
-                //4 momentum
+                //4 momentum and the photon may no longer be in the same cell (we update the photon position before doing the scattering)
+                //this also means that the photon may be in a completely new cell by the time it scatter though this is unlikely in high density regions
                 (ph->recalc_properties)=1;
             
             }
@@ -1359,9 +1490,6 @@ double averagePhotonEnergy(struct photonList *photon_list)
 {
     //to calculate weighted photon energy in ergs
     int i=0;
-    #if defined(_OPENMP)
-    int num_thread=omp_get_num_threads();
-    #endif
     double e_sum=0, w_sum=0;
     struct photon *ph=NULL;
     
@@ -1384,16 +1512,16 @@ double averagePhotonEnergy(struct photonList *photon_list)
 
 void phScattStats(struct photonList *photon_list, int *max, int *min, double *avg, double *r_avg, FILE *fPtr  )
 {
-    int temp_max=0, temp_min=INT_MAX,  i=0, count=0, count_synch=0, count_comp=0, count_i=0;
-    #if defined(_OPENMP)
-    int num_thread=omp_get_num_threads();
-    #endif
+    int temp_max=0, temp_min=INT_MAX,  i=0, count=0, count_synch=0, count_comp=0, count_i=0, num_thread=1;
     double sum=0, avg_r_sum=0, avg_r_sum_synch=0, avg_r_sum_comp=0, avg_r_sum_inject=0;
     struct photon *ph=NULL;
-
+    
+    #if defined(_OPENMP)
+        num_thread = omp_get_max_threads();
+    #endif
     
     //printf("Num threads: %d", num_thread);
-#pragma omp parallel for num_threads(num_thread) firstprivate(ph) reduction(min:temp_min) reduction(max:temp_max) reduction(+:sum) reduction(+:avg_r_sum) reduction(+:count)
+    #pragma omp parallel for num_threads(num_thread) firstprivate(ph) reduction(min:temp_min) reduction(max:temp_max) reduction(+:sum) reduction(+:avg_r_sum) reduction(+:count)
     for (i=0;i<photon_list->list_capacity;i++)
     {
         ph=getPhoton(photon_list, i);
@@ -1465,14 +1593,16 @@ void phScattStats(struct photonList *photon_list, int *max, int *min, double *av
 void phMinMax(struct photonList *photon_list, double *min, double *max, double *min_theta, double *max_theta, FILE *fPtr)
 {
     double temp_r_max=0, temp_r_min=DBL_MAX, temp_theta_max=0, temp_theta_min=DBL_MAX;
-    int i=0;
-    #if defined(_OPENMP)
-    int num_thread=omp_get_num_threads();
-    #endif
+    int i=0, num_thread=1;
     double ph_r=0, ph_theta=0;
     struct photon *ph=NULL;
     
-#pragma omp parallel for num_threads(num_thread) firstprivate(ph_r, ph_theta, ph) reduction(min:temp_r_min) reduction(max:temp_r_max) reduction(min:temp_theta_min) reduction(max:temp_theta_max)
+    #if defined(_OPENMP)
+        num_thread = omp_get_max_threads();
+    #endif
+
+    
+    #pragma omp parallel for num_threads(num_thread) firstprivate(ph_r, ph_theta, ph) reduction(min:temp_r_min) reduction(max:temp_r_max) reduction(min:temp_theta_min) reduction(max:temp_theta_max)
     for (i=0; i<photon_list->list_capacity; i++)
     {
         ph=getPhoton(photon_list, i);
@@ -1533,7 +1663,7 @@ void logspace(double start, double stop, int num, double *array)
     }
 }
 
-#if NONTHERMAL_E_DIST != OFF
+#if SCATTERING_BIAS_SWITCH == ON
     void calculateAverageDimlessTheta(struct hydro_dataframe *hydro_data, FILE *fPtr)
     {
         int i;
